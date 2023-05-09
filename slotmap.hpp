@@ -241,8 +241,6 @@ public:
         item_t& last_item = items[item_count];
         key_t& last_key = keys[owners[item_count].get()]; //key to the last item
 
-        last_key.index = key->index;
-
         if(key->index == last_key.index) //prevent self assignment
         {
             items[key->index].item_t::~item_t();
@@ -252,6 +250,8 @@ public:
             owners[key->index] = owners[item_count]; //move last item and its owner to the removed one
             items[key->index] = std::move(last_item);
         }
+
+        last_key.index = key->index;
 
         key_t& tail_key = keys[freelist_tail]; //set old tail to point to the new tail
         tail_key.index = std::distance(keys, key);
@@ -268,16 +268,16 @@ public:
         remove(get_key(item));
     }
 
-    bool remove(handle_t handle) //reurns if removal was actually done
+    uint64_t remove(handle_t handle) //returns index of the removed item or UINT64_MAX if handle was invalid
     {
         key_t* key = get_key(handle);
         if(key == nullptr)
         {
-            return false;
+            return UINT64_MAX;
         }
 
         remove(key);
-        return true;
+        return key->index;
     }
 
     void clear()
