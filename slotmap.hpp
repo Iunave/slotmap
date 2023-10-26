@@ -1,543 +1,357 @@
 #ifndef SLOTMAP_HPP
 #define SLOTMAP_HPP
 
-#include <climits>
-#include <bit>
-#include <cstring>
-#include <malloc.h>
 #include <cstdint>
-#include <cassert>
+#include <type_traits>
 #include <utility>
-#include <limits>
 #include <iterator>
 
-#ifndef UNLIKELY
-#define UNLIKELY(xpr) (__builtin_expect(!!(xpr), 0))
+#ifndef SLOTMAP_ASSERT
+#include <cassert>
+#define SLOTMAP_ASSERT(expr, ...) assert((expr) __VA_OPT__(&& __VA_ARGS__))
 #endif
 
-template<typename item_t>
-class slotmap_iterator_t
+struct SlotMapDefaultTraits
 {
-public:
-    explicit constexpr slotmap_iterator_t(item_t* in_ptr)
-        : ptr(in_ptr)
-    {
-    }
-
-    inline constexpr friend bool operator!=(slotmap_iterator_t lhs, slotmap_iterator_t rhs)
-    {
-        return lhs.ptr != rhs.ptr;
-    }
-
-    constexpr slotmap_iterator_t& operator+=(size_t offset)
-    {
-        ptr += offset;
-        return *this;
-    }
-
-    constexpr slotmap_iterator_t& operator-=(size_t offset)
-    {
-        ptr -= offset;
-        return *this;
-    }
-
-    constexpr slotmap_iterator_t operator+(size_t offset)
-    {
-        return slotmap_iterator_t{ptr + offset};
-    }
-
-    constexpr slotmap_iterator_t operator-(size_t offset)
-    {
-        return slotmap_iterator_t{ptr - offset};
-    }
-
-    constexpr size_t operator+(slotmap_iterator_t other)
-    {
-        return ptr + other.ptr;
-    }
-
-    constexpr size_t operator-(slotmap_iterator_t other)
-    {
-        return ptr - other.ptr;
-    }
-
-    constexpr slotmap_iterator_t& operator++()
-    {
-        ++ptr;
-        return *this;
-    }
-
-    constexpr slotmap_iterator_t& operator--()
-    {
-        --ptr;
-        return *this;
-    }
-
-    constexpr item_t* operator->()
-    {
-        return ptr;
-    }
-
-    constexpr item_t& operator*()
-    {
-        return *ptr;
-    }
-
-    item_t* to_ptr()
-    {
-        return ptr;
-    }
-
-    item_t* ptr;
+    static constexpr int64_t IndexBits = 40;
+    static constexpr int64_t IdBits = 64 - IndexBits;
+    static constexpr int64_t MinFreeKeys = 32;
+    static constexpr int64_t AllocationSize = 512; //how many items will fit in a memory allocation
 };
 
-/*
- * a slotmap is used to safely hold items without clear ownership,
- * items move but the keys do not, ie it is safe to reorder items in the slotmap
+/**
+ * @description A SlotMap is used to store items without clear ownership.
+ * Accessing an item is done trough a handle which stores an index to a key and an expected identifier
+ * if the identifiers differ the handle is considered to be invalid, otherwise the address of the item is retrieved trough the key.
+ * When an item is removed its corresponding key updates its ID - thus invalidating all existing handles to that key.
+ * @warning given enough time an ID will reach its maximum and wrap around which could create false positives when accessing that item
+ * currently this is caught by SLOTMAP_ASSERT
  */
-template<typename item_type>
-class slotmap_t
+template<typename ItemT, typename Traits = SlotMapDefaultTraits>
+class SlotMap
 {
 public:
+    static_assert(Traits::IndexBits > 0);
+    static_assert(Traits::IdBits > 0);
+    static_assert(Traits::MinFreeKeys >= 0);
+    static_assert(Traits::AllocationSize > 0);
+    static_assert(Traits::IndexBits + Traits::IdBits <= 64);
 
-    static constexpr size_t index_bits = 40;
-    static constexpr size_t id_bits = 64 - index_bits;
-    static constexpr size_t index_max = ~0ul >> (64 - index_bits);
-    static constexpr size_t id_max = ~0ul >> (64 - id_bits);
+    using KeyOffsetT = std::conditional_t<Traits::IndexBits <= 32, uint32_t, uint64_t>;
 
-    struct slotmap_key_t
+    static constexpr uint64_t IndexMax = UINT64_MAX >> (64 - Traits::IndexBits);
+    static constexpr uint64_t IdMax = UINT64_MAX >> (64 - Traits::IdBits); //in the worst case: we will have to remove the same item (IdMax - 1) * Traits::MinFreeKeys times to get an id reset
+
+    struct ItemKey
     {
-        inline constexpr friend bool operator==(slotmap_key_t lhs, slotmap_key_t rhs)
-        {
-            return std::bit_cast<uint64_t>(lhs) == std::bit_cast<uint64_t>(rhs);
-        }
+        //when free, specifies an offset to an item, otherwise to the next free key
+        uint64_t Index : Traits::IndexBits = 0;
 
-        inline constexpr friend bool operator!=(slotmap_key_t lhs, slotmap_key_t rhs)
-        {
-            return std::bit_cast<uint64_t>(lhs) != std::bit_cast<uint64_t>(rhs);
-        }
-
-        uint64_t index : index_bits; //when free, specifies an offset to an item, otherwise to the next free key
-        uint64_t id : id_bits; //id of an item
+        //id of the item pointed to by Index, 0 is an invalid ID in order to properly represent a null handle
+        uint64_t ID : Traits::IdBits = 0;
     };
 
-    struct slotmap_handle_t //handle used to refer to a key and its item
+    struct KeyHandle
     {
-        inline constexpr friend bool operator==(slotmap_handle_t lhs, slotmap_handle_t rhs)
-        {
-            return std::bit_cast<uint64_t>(lhs) == std::bit_cast<uint64_t>(rhs);
-        }
+        //offset to an ItemKey
+        uint64_t Index : Traits::IndexBits = 0;
 
-        inline constexpr friend bool operator!=(slotmap_handle_t lhs, slotmap_handle_t rhs)
-        {
-            return std::bit_cast<uint64_t>(lhs) != std::bit_cast<uint64_t>(rhs);
-        }
-
-        uint64_t key_value() const {return key;}
-        uint64_t id_value() const {return id;}
-
-        uint64_t key : index_bits; //offset to a key
-        uint64_t id : id_bits; //id of the item
+        //id of the item in ItemKey
+        uint64_t ID : Traits::IdBits = 0;
     };
 
-    using item_t = item_type;
-    using key_t = slotmap_key_t;
-    using handle_t = slotmap_handle_t;
+    static constexpr KeyHandle NullHandle{.Index = 0, .ID = 0};
 
-    using iterator_t = slotmap_iterator_t<item_t>;
-    using const_iterator_t = slotmap_iterator_t<const item_t>;
+private: //member variables
 
-    inline static constexpr size_t default_allocation_count = 1024;
-    inline static constexpr size_t min_free_keys = 32; //we will have to free the same key <id_max * min_free_keys> times to get an id reset (536,870,880)
+    ItemKey* Keys;
+    KeyOffsetT* KeyOffsets; //offset values "owned" by the corresponding item at the same index that is used the get the key of an item
+    ItemT* Items;
 
-    struct offset_t
+    int64_t KeyCount; //number of keys including free keys, is the same as the number of allocated keys
+
+    uint64_t FreelistHead; //first free key offset FIFO implementation
+    uint64_t FreelistTail; //last free key offset
+
+    int64_t ItemCount;
+    int64_t AllocatedItemCount;
+
+public:
+
+    SlotMap(const SlotMap&) = delete;
+    SlotMap(SlotMap&&) = delete;
+
+    SlotMap()
+        : Keys(nullptr)
+        , KeyOffsets(nullptr)
+        , Items(nullptr)
+        , KeyCount(0)
+        , FreelistHead(0)
+        , FreelistTail(0)
+        , ItemCount(0)
+        , AllocatedItemCount(0)
     {
-        offset_t(uint64_t offset)
-        {
-            set(offset);
-        }
-
-        uint64_t get() const
-        {
-            uint64_t offset = 0;
-            memcpy(&offset, data, 5);
-            return offset;
-        }
-
-        void set(uint64_t offset)
-        {
-            memcpy(data, &offset, 5);
-        }
-
-    private:
-        uint8_t data[5];
-    };
-    static_assert(sizeof(offset_t) * CHAR_BIT == index_bits);
-
-    slotmap_t()
-    {
-        item_count = 0;
-        key_count = default_allocation_count;
-
-        uint64_t key_bytes = key_count * sizeof(key_t);
-        uint64_t offset_bytes = pad_offsets_size(key_count * sizeof(offset_t));
-        uint64_t item_bytes = key_count * sizeof(item_t);
-
-        auto data = static_cast<uint8_t*>(malloc(key_bytes + offset_bytes + item_bytes));
-
-        keys = reinterpret_cast<key_t*>(data);
-        owners = reinterpret_cast<offset_t*>(data + key_bytes); //store the owners after the keys
-        items = reinterpret_cast<item_t *>(data + key_bytes + offset_bytes); //store the items after the owners
-
-        for(uint64_t index = 0; index < key_count; ++index)
-        {
-            keys[index].index = index + 1; //points one off the end but thats ok becouse we update it before we get to that point
-            keys[index].id = 0;
-        }
-
-        freelist_head = 0;
-        freelist_tail = key_count - 1;
     }
 
-    ~slotmap_t()
+    ~SlotMap()
     {
-        destroy_items();
-        free(keys);
+        if constexpr(!std::is_trivially_destructible_v<ItemT>)
+        {
+            while(ItemCount != 0)
+            {
+                --ItemCount;
+                Items[ItemCount].ItemT::~ItemT();
+            }
+        }
+
+        if(Keys)
+        {
+            free(Keys);
+        }
+
+        if(Items)
+        {
+            free(KeyOffsets);
+            free(Items);
+        }
+    }
+
+    bool IsValidHandle(KeyHandle Handle) const
+    {
+        return Handle.ID != 0 && Handle.Index < KeyCount && Handle.ID == Keys[Handle.Index].ID;
     }
 
     template<typename... Ts>
-    handle_t add(Ts&&... args)
+    KeyHandle Add(Ts... Args)
     {
-        if UNLIKELY(item_count == (key_count - min_free_keys)) //item count is always going to be less than key count
+        SLOTMAP_ASSERT(ItemCount < IndexMax, "reached max index. consider increasing IndexBits");
+
+        [[unlikely]] if(ItemCount >= (KeyCount - Traits::MinFreeKeys)) //item count will always be <= key count
         {
-            expand(default_allocation_count);
+            ResizeKeys((KeyCount + Traits::AllocationSize) & ~(Traits::AllocationSize - 1)); //round to next multiple of Traits::AllocationSize
         }
 
-        uint64_t key_index = freelist_head;
-        key_t& key = keys[key_index];
-
-        freelist_head = key.index;
-
-        key.index = item_count;
-        item_count += 1;
-
-        new(owners + key.index) offset_t{key_index};
-        new(items + key.index) item_t{std::forward<Ts>(args)...};
-
-        handle_t handle;
-        handle.id = key.id;
-        handle.key = key_index;
-
-        return handle;
-    }
-
-    void remove(key_t* key) //key HAS to be a pointer to one of our keys, no copies
-    {
-        assert(key >= keys && key < keys + key_count);
-
-        key->id += 1; //invalidate handles to this key... might wrap around
-        item_count -= 1;
-
-        item_t& last_item = items[item_count];
-        key_t& last_key = keys[owners[item_count].get()]; //key to the last item
-
-        if(key->index == last_key.index) //prevent self assignment
+        [[unlikely]] if(ItemCount == AllocatedItemCount)
         {
-            items[key->index].item_t::~item_t();
-        }
-        else
-        {
-            owners[key->index] = owners[item_count]; //move last item and its owner to the removed one
-            items[key->index] = std::move(last_item);
+            ResizeItems((ItemCount + Traits::AllocationSize) & ~(Traits::AllocationSize - 1)); //round to next multiple of Traits::AllocationSize
         }
 
-        last_key.index = key->index;
+        uint64_t KeyIndex = FreelistHead; //pick the free head key
+        ItemKey& Key = Keys[KeyIndex];
 
-        key_t& tail_key = keys[freelist_tail]; //set old tail to point to the new tail
-        tail_key.index = std::distance(keys, key);
-        freelist_tail = tail_key.index;
+        FreelistHead = Key.Index;
+
+        Key.Index = ItemCount;
+        ItemCount += 1;
+
+        KeyOffsets[Key.Index] = KeyIndex;
+        new(Items + Key.Index) ItemT{std::forward<Ts>(Args)...};
+
+        return KeyHandle{.Index = KeyIndex, .ID = Key.ID};
     }
 
-    void remove(uint64_t index)
+    //returns false if the handle was invalid, true otherwise
+    bool Remove(KeyHandle Handle)
     {
-        remove(get_key(index));
-    }
-
-    void remove(item_t* item)
-    {
-        remove(get_key(item));
-    }
-
-    uint64_t remove(handle_t handle) //returns index of the removed item or UINT64_MAX if handle was invalid
-    {
-        key_t* key = get_key(handle);
-        if(key == nullptr)
+        ItemKey* Key = GetKey(Handle);
+        if(Key == nullptr)
         {
-            return UINT64_MAX;
+            return false;
         }
 
-        remove(key);
-        return key->index;
+        Remove(Key);
+        return true;
     }
 
-    void clear()
+    void Remove(uint64_t Index)
     {
-        while(item_count != 0)
+        Remove(GetKey(Index));
+    }
+
+    void Remove(ItemT* Item)
+    {
+        Remove(GetKey(Item));
+    }
+
+    void Clear()
+    {
+        while(ItemCount != 0)
         {
-            remove(keys + owners[item_count - 1].get());
+            Remove(ItemCount - 1);
         }
     }
 
-    void expand(uint64_t count)
+    KeyHandle GetHandle(int64_t Index) const
     {
-        uint64_t old_key_count = key_count;
-        key_count += count;
+        SLOTMAP_ASSERT((Index >= 0) & (Index < ItemCount));
 
-        uint64_t old_key_bytes = old_key_count * sizeof(key_t);
-        uint64_t key_bytes = key_count * sizeof(key_t);
-        uint64_t old_offset_bytes = pad_offsets_size(old_key_count * sizeof(offset_t));
-        uint64_t offset_bytes = pad_offsets_size(key_count * sizeof(offset_t));
-        uint64_t item_bytes = key_count * sizeof(item_t);
+        uint64_t KeyIndex = KeyOffsets[Index];
+        uint64_t KeyID = Keys[KeyIndex].ID;
 
-        auto data = static_cast<uint8_t*>(realloc(keys, key_bytes + offset_bytes + item_bytes));
+        return KeyHandle{.Index = KeyIndex, .ID = KeyID};
+    }
 
-        keys = reinterpret_cast<key_t*>(data);
-        owners = reinterpret_cast<offset_t*>(data + key_bytes);
-        items = reinterpret_cast<item_t*>(data + key_bytes + offset_bytes);
+    KeyHandle GetHandle(ItemT* Item) const
+    {
+        return GetHandle(std::distance(Items, Item));
+    }
 
-        memcpy(items, data + old_key_bytes + old_offset_bytes, sizeof(item_t) * item_count); //push items
-        memcpy(owners, data + old_key_bytes, sizeof(offset_t) * item_count); //push offsets
-
-        for(uint64_t index = old_key_count; index < key_count; ++index) //initialize new keys
+    template<typename Self>
+    decltype(auto) operator[](this Self&& self, KeyHandle Handle)
+    {
+        if(auto* Key = self.GetKey(Handle))
         {
-            keys[index].index = index + 1;
-            keys[index].id = 0;
+            return self.Items + Key->Index;
         }
 
-        key_t& tail_key = keys[freelist_tail]; //set old tail to point to the first new key
-        tail_key.index = old_key_count;
-        freelist_tail = key_count - 1; //new tail is the last added key
+        return (decltype(self.Items))nullptr;
     }
 
-    bool is_valid_handle(handle_t handle) const
+    template<typename Self>
+    decltype(auto) operator[](this Self&& self, int64_t Index)
     {
-        return handle.key < key_count && handle.id == keys[handle.key].id;
+        SLOTMAP_ASSERT((Index >= 0) & (Index < self.ItemCount));
+        return self.Items[Index];
     }
 
-    uint64_t get_index(const item_t* item) const
+    template<typename Self>
+    decltype(auto) begin(this Self&& self)
     {
-        assert(item >= items && item < item + item_count);
-        return std::distance((const item_t*)items, item);
+        return self.Items;
     }
 
-    uint64_t get_index(handle_t handle)
+    template<typename Self>
+    decltype(auto) end(this Self&& self)
     {
-        const item_t* item = operator[](handle);
-        if(item == nullptr)
-        {
-            return index_max;
-        }
-
-        return get_index(item);
+        return self.Items + self.ItemCount;
     }
 
-    key_t* get_key(uint64_t index)
+    int64_t Size() const
     {
-        assert(index < item_count);
-        return keys + owners[index].get();
+        return ItemCount;
     }
 
-    const key_t* get_key(uint64_t index) const
+    int64_t SizeBytes() const
     {
-        assert(index < item_count);
-        return keys + owners[index].get();
-    }
-
-    key_t* get_key(const item_t* item)
-    {
-        return get_key(get_index(item));
-    }
-
-    const key_t* get_key(const item_t* item) const
-    {
-        return get_key(get_index(item));
-    }
-
-    key_t* get_key(handle_t handle)
-    {
-        if(handle.key >= key_count || handle.id != keys[handle.key].id)
-        {
-            return nullptr;
-        }
-
-        return keys + handle.key;
-    }
-
-    const key_t* get_key(handle_t handle) const
-    {
-        return get_key(handle);
-    }
-
-    handle_t get_handle(uint64_t index) const
-    {
-        assert(index < item_count);
-
-        handle_t handle;
-        handle.key = owners[index].get();
-        handle.id = keys[handle.key].id;
-        return handle;
-    }
-
-    handle_t get_handle(const item_t* item) const
-    {
-        return get_handle(get_index(item));
-    }
-
-    handle_t insert(const item_type& item, uint64_t at)
-    {
-        assert(at < item_count);
-
-        key_t& key = keys[owners[at].get()];
-        key.id += 1;
-
-        items[at] = item;
-
-        handle_t handle;
-        handle.key = owners[at];
-        handle.id = key.id;
-        return handle;
-    }
-
-    handle_t insert(item_type&& item, uint64_t at)
-    {
-        assert(at < item_count);
-
-        key_t& key = keys[owners[at].get()];
-        key.id += 1;
-
-        items[at] = std::move(item);
-
-        handle_t handle;
-        handle.key = owners[at];
-        handle.id = key.id;
-        return handle;
-    }
-
-    item_type* operator[](handle_t handle)
-    {
-        const key_t* key = get_key(handle);
-        if(key == nullptr)
-        {
-            return nullptr;
-        }
-
-        return items + key->index;
-    }
-
-    const item_type* operator[](handle_t handle) const
-    {
-        return operator[](handle);
-    }
-
-    item_type& operator[](key_t key) //unsafe function, key is assumed to be valid
-    {
-        return items + key.index;
-    }
-
-    const item_type& operator[](key_t key) const//unsafe function, key is assumed to be valid
-    {
-        return operator[](key);
-    }
-
-    item_type& operator[](uint64_t index)
-    {
-        assert(index < item_count);
-        return items[index];
-    }
-
-    const item_type& operator[](uint64_t index) const
-    {
-        return operator[](index);
-    }
-
-    uint64_t size() const
-    {
-        return item_count;
-    }
-
-    uint64_t available_size() const
-    {
-        return key_count - item_count - min_free_keys;
-    }
-
-    uint64_t max_size() const
-    {
-        return index_max;
-    }
-
-    item_t* data()
-    {
-        return items;
-    }
-
-    const item_t* data() const
-    {
-        return items;
-    }
-
-    iterator_t begin()
-    {
-        return iterator_t{items};
-    }
-
-    iterator_t end()
-    {
-        return iterator_t{items + item_count};
-    }
-
-    const_iterator_t begin() const
-    {
-        return const_iterator_t{items};
-    }
-
-    const_iterator_t end() const
-    {
-        return const_iterator_t{items + item_count};
+        return ItemCount * sizeof(ItemT);
     }
 
 private:
 
-    uint64_t pad_offsets_size(uint64_t size)
+    //key has to be a pointer to a key in Keys, no copies
+    void Remove(ItemKey* Key) __attribute_nonnull__((2))
     {
-        constexpr uint64_t min_alignment = alignof(item_t);
-        return (size + min_alignment - 1) & ~(min_alignment - 1);
+        SLOTMAP_ASSERT(Key->ID < IdMax, "reached max id. consider increasing IdBits and/or MinFreeKeys");
+
+        Key->ID += 1; //invalidate handles to this key.
+        ItemCount -= 1;
+
+        ItemKey& LastKey = Keys[KeyOffsets[ItemCount]];
+
+        [[unlikely]] if(Key->Index == LastKey.Index) //prevent self assignment
+        {
+            Items[Key->Index].ItemT::~ItemT();
+        }
+        else //move last item and its key offset to the removed item
+        {
+            KeyOffsets[Key->Index] = KeyOffsets[ItemCount];
+            Items[Key->Index] = std::move(Items[ItemCount]);
+        }
+
+        LastKey.Index = Key->Index;
+
+        ItemKey& TailKey = Keys[FreelistTail]; //set old tail to point to the new tail (this key)
+        TailKey.Index = std::distance(Keys, Key);
+        FreelistTail = TailKey.Index;
+
+        [[unlikely]] if(AllocatedItemCount >= (ItemCount + Traits::AllocationSize * 2)) //test if its worth to shrink items
+        {
+            ResizeItems((ItemCount + Traits::AllocationSize - 1) & ~(Traits::AllocationSize - 1)); //resize items to first multiple of Traits::AllocationSize
+        }
     }
 
-    void destroy_items()
+    void ResizeItems(int64_t Count)
     {
-        if constexpr(!std::is_trivially_destructible_v<item_t>)
+        SLOTMAP_ASSERT(Count >= ItemCount, "shrinking allocation below alive items is not allowed");
+
+        if(Count != AllocatedItemCount)
         {
-            while(item_count != 0)
+            AllocatedItemCount = Count;
+
+            KeyOffsets = static_cast<KeyOffsetT*>(realloc(KeyOffsets, AllocatedItemCount * sizeof(KeyOffsetT)));
+
+            if constexpr(std::is_trivially_copyable_v<ItemT>)
             {
-                --item_count;
-                items[item_count].item_t::~item_t();
+                Items = static_cast<ItemT*>(realloc(Items, AllocatedItemCount * sizeof(ItemT)));
+            }
+            else
+            {
+                auto* NewItems = static_cast<ItemT*>(malloc(AllocatedItemCount * sizeof(ItemT)));
+
+                for(int64_t Index = 0; Index < ItemCount; ++Index)
+                {
+                    new(NewItems + Index) ItemT{std::move(Items[Index])};
+                }
+
+                if(Items != nullptr)
+                {
+                    free(Items);
+                }
+
+                Items = NewItems;
             }
         }
-        else
+    }
+
+    void ResizeKeys(int64_t Count)
+    {
+        SLOTMAP_ASSERT(Count >= KeyCount, "shrinking key allocation is not allowed");
+
+        if(Count != KeyCount)
         {
-            item_count = 0;
+            int64_t OldKeyCount = KeyCount;
+            KeyCount = Count;
+
+            Keys = static_cast<ItemKey*>(realloc(Keys, KeyCount * sizeof(ItemKey)));
+
+            for(int64_t idx = OldKeyCount; idx < KeyCount; ++idx) //initialize new keys
+            {
+                Keys[idx].Index = idx + 1; //points one off the end but that's ok because we update it before we get to that point
+                Keys[idx].ID = 1;
+            }
+
+            if(FreelistTail != FreelistHead)
+            {
+                Keys[FreelistTail].Index = OldKeyCount; //set old tail to point to the first new key
+            }
+
+            FreelistTail = KeyCount - 1; //new tail is the last added key
         }
     }
 
-    key_t* keys; //owns the allocation
-    offset_t* owners; //used to reference the owning key of an item, same count and order as items
-    item_t* items;
+    template<typename Self>
+    decltype(auto) GetKey(this Self&& self, KeyHandle Handle)
+    {
+        if(self.IsValidHandle(Handle))
+        {
+            return self.Keys + Handle.Index;
+        }
 
-    uint64_t item_count; //number of active items
-    uint64_t key_count; //number of keys, including free ones
+        return (decltype(self.Keys))nullptr;
+    }
 
-    uint64_t freelist_head; //first free key offset FIFO implementation
-    uint64_t freelist_tail; //last free key offset
+    template<typename Self>
+    decltype(auto) GetKey(this Self&& self, int64_t ItemIndex)
+    {
+        SLOTMAP_ASSERT((ItemIndex >= 0) & (ItemIndex < self.ItemCount));
+        return self.Keys + self.KeyOffsets[ItemIndex];
+    }
+
+    template<typename Self>
+    decltype(auto) GetKey(this Self&& self, ItemT* Item)
+    {
+        return self.GetKey(std::distance(self.Items, Item));
+    }
 };
 
 #endif //SLOTMAP_HPP
